@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Upstream tag (e.g. v5.1.0) or "latest"'
+        required: false
+        default: 'latest'
+  push:
+    branches: [main]
+    paths:
+      - 'patches/**'
+      - '.github/workflows/**'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout patcher
+        uses: actions/checkout@v4
+        with:
+          path: patcher
+
+      - name: Resolve upstream tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          ref="${INPUT_REF:-latest}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            ref="latest"
+          fi
+          if [ "$ref" = "latest" ]; then
+            tag=$(gh release view -R obra/superpowers --json tagName -q .tagName)
+            echo "Resolved 'latest' -> $tag"
+          else
+            tag="$ref"
+          fi
+          echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Compute version
+        id: version
+        run: |
+          set -euo pipefail
+          ts=$(date -u +%Y%m%d%H%M)
+          version="${{ steps.resolve.outputs.upstream_tag }}-${ts}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check tag collision
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          repo_url="https://github.com/${{ github.repository }}.git"
+          if git ls-remote --exit-code --tags "$repo_url" "refs/tags/${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Tag ${VERSION} already exists"
+            exit 1
+          fi
+
+      - name: Clone upstream
+        env:
+          UPSTREAM_TAG: ${{ steps.resolve.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch "${UPSTREAM_TAG}" https://github.com/obra/superpowers.git upstream
+
+      - name: Apply patches
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(patcher/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "::error::No patches found"
+            exit 1
+          fi
+          cd upstream
+          for p in "${patches[@]}"; do
+            name=$(basename "$p")
+            echo "Applying $name"
+            git apply --check "../$p"
+            git apply "../$p"
+          done
+
+      - name: Build orphan release branch
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          UPSTREAM_TAG: ${{ steps.resolve.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          cd upstream
+          git checkout --orphan "release/${VERSION}"
+          git rm -rf --cached . >/dev/null
+          git add -A
+          git -c user.email=actions@github.com \
+              -c user.name="superpowers-patcher" \
+              commit -m "Release ${VERSION}" -m "Based on upstream: obra/superpowers@${UPSTREAM_TAG}"
+
+      - name: Push branch and tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd upstream
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git push origin "release/${VERSION}"
+          git tag "${VERSION}"
+          git push origin "${VERSION}"
+          git tag -f latest
+          git push origin latest --force
+
+      - name: Create GitHub Release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${VERSION}" \
+            --repo "${{ github.repository }}" \
+            --target "release/${VERSION}" \
+            --title "${VERSION}" \
+            --notes "Based on upstream [obra/superpowers@${{ steps.resolve.outputs.upstream_tag }}](https://github.com/obra/superpowers/releases/tag/${{ steps.resolve.outputs.upstream_tag }})"
