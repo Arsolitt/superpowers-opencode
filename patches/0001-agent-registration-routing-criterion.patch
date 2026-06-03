@@ -1,0 +1,620 @@
+From 73a6f10fec6b345516ed764139de9b6f90634794 Mon Sep 17 00:00:00 2001
+From: Arsolitt <arsolitt@gmail.com>
+Date: Wed, 3 Jun 2026 16:23:21 +0300
+Subject: [PATCH] All patches: agent registration, subagent routing,
+ architecture criterion, SDD rewrite
+
+Signed-off-by: Arsolitt <arsolitt@gmail.com>
+---
+ .opencode/plugins/superpowers.js              | 223 +++++++++++++++++-
+ skills/brainstorming/SKILL.md                 |   1 +
+ .../spec-document-reviewer-prompt.md          |   3 +-
+ skills/requesting-code-review/SKILL.md        |   2 +-
+ .../requesting-code-review/code-reviewer.md   |   2 +-
+ skills/subagent-driven-development/SKILL.md   | 105 ++++++---
+ .../code-quality-reviewer-prompt.md           |   2 +-
+ .../implementer-prompt.md                     |   2 +-
+ .../spec-reviewer-prompt.md                   |   2 +-
+ .../plan-document-reviewer-prompt.md          |   2 +-
+ 10 files changed, 298 insertions(+), 46 deletions(-)
+
+diff --git a/.opencode/plugins/superpowers.js b/.opencode/plugins/superpowers.js
+index f2b95f2..2ae635c 100644
+--- a/.opencode/plugins/superpowers.js
++++ b/.opencode/plugins/superpowers.js
+@@ -3,11 +3,12 @@
+  *
+  * Injects superpowers bootstrap context via system prompt transform.
+  * Auto-registers skills directory via config hook (no symlinks needed).
++ * Registers model-aware agents for subagent-driven development.
+  */
+ 
+-import path from 'path';
+ import fs from 'fs';
+ import os from 'os';
++import path from 'path';
+ import { fileURLToPath } from 'url';
+ 
+ const __dirname = path.dirname(fileURLToPath(import.meta.url));
+@@ -46,17 +47,223 @@ const normalizePath = (p, homeDir) => {
+   return path.resolve(normalized);
+ };
+ 
++const stripJsonComments = (content) => content
++  .replace(/\/\*[\s\S]*?\*\//g, '')
++  .replace(/^\s*\/\/.*$/gm, '');
++
++const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
++
++const deepMerge = (base, override) => {
++  if (!isPlainObject(base) || !isPlainObject(override)) {
++    return override;
++  }
++
++  const merged = { ...base };
++  for (const [key, value] of Object.entries(override)) {
++    if (isPlainObject(value) && isPlainObject(merged[key])) {
++      merged[key] = deepMerge(merged[key], value);
++      continue;
++    }
++    merged[key] = value;
++  }
++  return merged;
++};
++
++const AGENT_PROMPTS = {
++  'implementer-sp': `You are an implementation agent for the superpowers subagent-driven development workflow.
++
++Your job is to implement a task from a plan. The controller will provide:
++- Full task description (from the plan)
++- Context (where this fits, dependencies, architecture)
++
++## Before You Begin
++
++If you have questions about the requirements, approach, dependencies, or anything unclear — ask them now. Raise concerns before starting work.
++
++## Your Job
++
++Once you're clear on requirements:
++1. Implement exactly what the task specifies
++2. Write tests (following TDD if task says to)
++3. Verify implementation works
++4. Commit your work
++5. Self-review (see below)
++6. Report back
++
++**While you work:** If you encounter something unexpected or unclear, ask questions. Don't guess or make assumptions.
++
++## Before Reporting Back: Self-Review
++
++Review your work with fresh eyes:
++
++**Completeness:** Did I implement everything in the spec? Miss any requirements? Edge cases?
++**Quality:** Is this my best work? Are names clear? Is code clean and maintainable?
++**Discipline:** Did I avoid overbuilding (YAGNI)? Only build what was requested? Follow existing patterns?
++**Testing:** Do tests verify behavior (not mocks)? Did I follow TDD if required? Are tests comprehensive?
++
++If you find issues during self-review, fix them before reporting.
++
++## Report Format
++
++When done, report:
++- What you implemented
++- What you tested and test results
++- Files changed
++- Self-review findings (if any)
++- Any issues or concerns`,
++
++  'spec-reviewer-sp': `You are a spec compliance reviewer for the superpowers subagent-driven development workflow.
++
++Your job is to verify that an implementation matches its specification — nothing more, nothing less.
++
++The controller will provide:
++- Full task requirements (from the plan)
++- Implementer's report of what they claim they built
++
++## CRITICAL: Do Not Trust the Report
++
++The implementer's report may be incomplete, inaccurate, or optimistic. You MUST verify everything independently.
++
++**DO NOT:** Take their word for what they implemented. Trust their claims about completeness. Accept their interpretation of requirements.
++
++**DO:** Read the actual code they wrote. Compare actual implementation to requirements line by line. Check for missing pieces. Look for extra features they didn't mention.
++
++## Your Job
++
++Read the implementation code and verify:
++
++**Missing requirements:** Did they implement everything requested? Are there requirements they skipped? Did they claim something works but didn't actually implement it?
++
++**Extra/unneeded work:** Did they build things that weren't requested? Did they over-engineer? Did they add "nice to haves" not in spec?
++
++**Misunderstandings:** Did they interpret requirements differently than intended? Did they solve the wrong problem?
++
++**Verify by reading code, not by trusting report.**
++
++## Report Format
++
++- ✅ Spec compliant (if everything matches after code inspection)
++- ❌ Issues found: [list specifically what's missing or extra, with file:line references]`,
++
++  'code-reviewer-sp': `You are a senior code reviewer for the superpowers subagent-driven development workflow.
++
++You review code changes for production readiness. Only dispatched after spec compliance passes.
++
++The controller will provide:
++- What was implemented (from implementer's report)
++- Plan/requirements reference
++- Git SHA range to review
++
++## Review Checklist
++
++**Code Quality:** Clean separation of concerns? Proper error handling? Type safety? DRY? Edge cases handled?
++**Architecture:** Sound design decisions? Scalability? Performance implications? Security concerns?
++**Testing:** Tests actually test logic (not mocks)? Edge cases covered? Integration tests where needed? All tests passing?
++**Requirements:** All plan requirements met? No scope creep? Breaking changes documented?
++**Production Readiness:** Migration strategy? Backward compatibility? No obvious bugs?
++
++## Output Format
++
++### Strengths
++[What's well done? Be specific with file:line references.]
++
++### Issues
++
++#### Critical (Must Fix)
++[Bugs, security issues, data loss risks]
++
++#### Important (Should Fix)
++[Architecture problems, missing features, poor error handling, test gaps]
++
++#### Minor (Nice to Have)
++[Code style, optimization, documentation]
++
++**For each issue:** file:line reference, what's wrong, why it matters, how to fix.
++
++### Assessment
++**Ready to merge?** [Yes/No/With fixes]
++**Reasoning:** [1-2 sentences]
++
++## Rules
++- Categorize by actual severity (not everything is Critical)
++- Be specific (file:line, not vague)
++- Explain WHY issues matter
++- Acknowledge strengths
++- Give clear verdict`
++};
++
++const AGENT_DEFAULTS = {
++  'implementer-sp': {
++    description: 'Superpowers: implements tasks from plan following TDD. Writes code, tests, commits.',
++    model: 'anthropic/claude-sonnet-4-6',
++    mode: 'subagent',
++    tools: { bash: true, read: true, write: true, edit: true, glob: true, grep: true, list: true, todoread: true, todowrite: true },
++    permission: { edit: 'allow', bash: { '*': 'allow' } }
++  },
++  'spec-reviewer-sp': {
++    description: 'Superpowers: reviews implementation against spec. Verifies completeness, catches missing/extra work.',
++    model: 'anthropic/claude-sonnet-4-6',
++    mode: 'subagent',
++    tools: { read: true, glob: true, grep: true, list: true, bash: true },
++    permission: { bash: { '*': 'allow' } }
++  },
++  'code-reviewer-sp': {
++    description: 'Superpowers: deep code review — architecture, quality, security, maintainability.',
++    model: 'anthropic/claude-opus-4-6',
++    mode: 'subagent',
++    tools: { read: true, glob: true, grep: true, list: true, bash: true },
++    permission: { bash: { '*': 'allow' } }
++  }
++};
++
++const DEFAULT_SUPERPOWERS_CONFIG = `{
++  // Superpowers-specific OpenCode overrides.
++  // Edit models here instead of creating agent entries manually in opencode.json.
++  "agent": {
++    "implementer-sp": {
++      "model": "anthropic/claude-sonnet-4-6"
++    },
++    "spec-reviewer-sp": {
++      "model": "anthropic/claude-sonnet-4-6"
++    },
++    "code-reviewer-sp": {
++      "model": "anthropic/claude-opus-4-6"
++    }
++  }
++}
++`;
++
+ // Module-level cache for bootstrap content.
+ // The SKILL.md file does not change during a session, so reading + parsing it
+ // once eliminates redundant fs.existsSync + fs.readFileSync + regex work on
+ // every agent step.  See #1202 for the full analysis.
+ let _bootstrapCache = undefined; // undefined = not yet loaded, null = file missing
+ 
+ export const SuperpowersPlugin = async ({ client, directory }) => {
+   const homeDir = os.homedir();
+   const superpowersSkillsDir = path.resolve(__dirname, '../../skills');
+   const envConfigDir = normalizePath(process.env.OPENCODE_CONFIG_DIR, homeDir);
+   const configDir = envConfigDir || path.join(homeDir, '.config/opencode');
++  const superpowersConfigPath = path.join(configDir, 'superpowers.jsonc');
++
++  const ensureSuperpowersConfig = () => {
++    if (fs.existsSync(superpowersConfigPath)) return;
++    fs.mkdirSync(path.dirname(superpowersConfigPath), { recursive: true });
++    fs.writeFileSync(superpowersConfigPath, DEFAULT_SUPERPOWERS_CONFIG, 'utf8');
++  };
++
++  const loadSuperpowersConfig = () => {
++    ensureSuperpowersConfig();
++
++    try {
++      const rawContent = fs.readFileSync(superpowersConfigPath, 'utf8');
++      const parsed = JSON.parse(stripJsonComments(rawContent));
++      return isPlainObject(parsed) ? parsed : {};
++    } catch (error) {
++      console.warn(`[superpowers] Failed to parse ${superpowersConfigPath}: ${error.message}`);
++      return {};
++    }
++  };
+ 
+   // Helper to generate bootstrap content (cached after first call)
+   const getBootstrapContent = () => {
+@@ -106,6 +313,20 @@ ${toolMapping}
+       if (!config.skills.paths.includes(superpowersSkillsDir)) {
+         config.skills.paths.push(superpowersSkillsDir);
+       }
++
++      const superpowersConfig = loadSuperpowersConfig();
++      const mergedConfig = deepMerge(config, superpowersConfig);
++      const agents = mergedConfig.agent || {};
++
++      for (const [name, defaults] of Object.entries(AGENT_DEFAULTS)) {
++        agents[name] = {
++          ...defaults,
++          prompt: AGENT_PROMPTS[name],
++          ...(agents[name] || {})
++        };
++      }
++
++      Object.assign(config, mergedConfig, { agent: agents });
+     },
+ 
+     // Inject bootstrap into the first user message of each session.
+diff --git a/skills/brainstorming/SKILL.md b/skills/brainstorming/SKILL.md
+index 06cd0a2..4307cdf 100644
+--- a/skills/brainstorming/SKILL.md
++++ b/skills/brainstorming/SKILL.md
+@@ -134,6 +134,7 @@ Wait for the user's response. If they request changes, make them and re-run the
+ 
+ - Invoke the writing-plans skill to create a detailed implementation plan
+ - Do NOT invoke any other skill. writing-plans is the next step.
++- **Model routing (OpenCode):** The superpowers plugin registers dedicated agents (`@implementer-sp`, `@spec-reviewer-sp`, `@code-reviewer-sp`) with appropriate model tiers. Brainstorming and planning run on the current (typically stronger) model; implementation is automatically dispatched to cost-effective models via subagent-driven-development. No manual model switching needed.
+ 
+ ## Key Principles
+ 
+diff --git a/skills/brainstorming/spec-document-reviewer-prompt.md b/skills/brainstorming/spec-document-reviewer-prompt.md
+index 35acbb6..212b2dc 100644
+--- a/skills/brainstorming/spec-document-reviewer-prompt.md
++++ b/skills/brainstorming/spec-document-reviewer-prompt.md
+@@ -7,22 +7,23 @@ Use this template when dispatching a spec document reviewer subagent.
+ **Dispatch after:** Spec document is written to docs/superpowers/specs/
+ 
+ ```
+-Task tool (general-purpose):
++Task tool (use `@code-reviewer-sp` subagent if available in this OpenCode session; otherwise `general-purpose`):
+   description: "Review spec document"
+   prompt: |
+     You are a spec document reviewer. Verify this spec is complete and ready for planning.
+ 
+     **Spec to review:** [SPEC_FILE_PATH]
+ 
+     ## What to Check
+ 
+     | Category | What to Look For |
+     |----------|------------------|
+     | Completeness | TODOs, placeholders, "TBD", incomplete sections |
+     | Consistency | Internal contradictions, conflicting requirements |
+     | Clarity | Requirements ambiguous enough to cause someone to build the wrong thing |
+     | Scope | Focused enough for a single plan — not covering multiple independent subsystems |
+     | YAGNI | Unrequested features, over-engineering |
++    | Architecture | Units with clear boundaries, well-defined interfaces, independently understandable and testable |
+ 
+     ## Calibration
+ 
+diff --git a/skills/requesting-code-review/SKILL.md b/skills/requesting-code-review/SKILL.md
+index 34b8340..6785534 100644
+--- a/skills/requesting-code-review/SKILL.md
++++ b/skills/requesting-code-review/SKILL.md
+@@ -31,7 +31,7 @@ HEAD_SHA=$(git rev-parse HEAD)
+ 
+ **2. Dispatch code reviewer subagent:**
+ 
+-Use Task tool with `general-purpose` type, fill template at `code-reviewer.md`
++Use Task tool with `@code-reviewer-sp` subagent if available in this OpenCode session; otherwise `general-purpose`. Fill template at `code-reviewer.md`
+ 
+ **Placeholders:**
+ - `{DESCRIPTION}` - Brief summary of what you built
+diff --git a/skills/requesting-code-review/code-reviewer.md b/skills/requesting-code-review/code-reviewer.md
+index 525e4b4..6e88a5b 100644
+--- a/skills/requesting-code-review/code-reviewer.md
++++ b/skills/requesting-code-review/code-reviewer.md
+@@ -5,7 +5,7 @@ Use this template when dispatching a code reviewer subagent.
+ **Purpose:** Review completed work against requirements and code quality standards before it cascades into more work.
+ 
+ ```
+-Task tool (general-purpose):
++Task tool (use `@code-reviewer-sp` subagent if available in this OpenCode session; otherwise `general-purpose`):
+   description: "Review code changes"
+   prompt: |
+     You are a Senior Code Reviewer with expertise in software architecture,
+diff --git a/skills/subagent-driven-development/SKILL.md b/skills/subagent-driven-development/SKILL.md
+index ea7ac8f..8791ab1 100644
+--- a/skills/subagent-driven-development/SKILL.md
++++ b/skills/subagent-driven-development/SKILL.md
+@@ -11,8 +11,6 @@ Execute plan by dispatching fresh subagent per task, with two-stage review after
+ 
+ **Core principle:** Fresh subagent per task + two-stage review (spec then quality) = high quality, fast iteration
+ 
+-**Continuous execution:** Do not pause to check in with your human partner between tasks. Execute all tasks from the plan without stopping. The only reasons to stop are: BLOCKED status you cannot resolve, ambiguity that genuinely prevents progress, or all tasks complete. "Should I continue?" prompts and progress summaries waste their time — they asked you to execute the plan, so execute it.
+-
+ ## When to Use
+ 
+ ```dot
+@@ -47,42 +45,42 @@ digraph process {
+ 
+     subgraph cluster_per_task {
+         label="Per Task";
+-        "Dispatch implementer subagent (./implementer-prompt.md)" [shape=box];
+-        "Implementer subagent asks questions?" [shape=diamond];
++        "Dispatch @implementer-sp with task text and context" [shape=box];
++        "Implementer asks questions?" [shape=diamond];
+         "Answer questions, provide context" [shape=box];
+-        "Implementer subagent implements, tests, commits, self-reviews" [shape=box];
+-        "Dispatch spec reviewer subagent (./spec-reviewer-prompt.md)" [shape=box];
+-        "Spec reviewer subagent confirms code matches spec?" [shape=diamond];
+-        "Implementer subagent fixes spec gaps" [shape=box];
+-        "Dispatch code quality reviewer subagent (./code-quality-reviewer-prompt.md)" [shape=box];
+-        "Code quality reviewer subagent approves?" [shape=diamond];
+-        "Implementer subagent fixes quality issues" [shape=box];
++        "Implementer implements, tests, commits, self-reviews" [shape=box];
++        "Dispatch @spec-reviewer-sp with requirements and report" [shape=box];
++        "Spec reviewer confirms code matches spec?" [shape=diamond];
++        "Implementer fixes spec gaps" [shape=box];
++        "Dispatch @code-reviewer-sp with SHAs and description" [shape=box];
++        "Code reviewer approves?" [shape=diamond];
++        "Implementer fixes quality issues" [shape=box];
+         "Mark task complete in TodoWrite" [shape=box];
+     }
+ 
+     "Read plan, extract all tasks with full text, note context, create TodoWrite" [shape=box];
+     "More tasks remain?" [shape=diamond];
+-    "Dispatch final code reviewer subagent for entire implementation" [shape=box];
++    "Dispatch @code-reviewer-sp for entire implementation" [shape=box];
+     "Use superpowers:finishing-a-development-branch" [shape=box style=filled fillcolor=lightgreen];
+ 
+-    "Read plan, extract all tasks with full text, note context, create TodoWrite" -> "Dispatch implementer subagent (./implementer-prompt.md)";
+-    "Dispatch implementer subagent (./implementer-prompt.md)" -> "Implementer subagent asks questions?";
+-    "Implementer subagent asks questions?" -> "Answer questions, provide context" [label="yes"];
+-    "Answer questions, provide context" -> "Dispatch implementer subagent (./implementer-prompt.md)";
+-    "Implementer subagent asks questions?" -> "Implementer subagent implements, tests, commits, self-reviews" [label="no"];
+-    "Implementer subagent implements, tests, commits, self-reviews" -> "Dispatch spec reviewer subagent (./spec-reviewer-prompt.md)";
+-    "Dispatch spec reviewer subagent (./spec-reviewer-prompt.md)" -> "Spec reviewer subagent confirms code matches spec?";
+-    "Spec reviewer subagent confirms code matches spec?" -> "Implementer subagent fixes spec gaps" [label="no"];
+-    "Implementer subagent fixes spec gaps" -> "Dispatch spec reviewer subagent (./spec-reviewer-prompt.md)" [label="re-review"];
+-    "Spec reviewer subagent confirms code matches spec?" -> "Dispatch code quality reviewer subagent (./code-quality-reviewer-prompt.md)" [label="yes"];
+-    "Dispatch code quality reviewer subagent (./code-quality-reviewer-prompt.md)" -> "Code quality reviewer subagent approves?";
+-    "Code quality reviewer subagent approves?" -> "Implementer subagent fixes quality issues" [label="no"];
+-    "Implementer subagent fixes quality issues" -> "Dispatch code quality reviewer subagent (./code-quality-reviewer-prompt.md)" [label="re-review"];
+-    "Code quality reviewer subagent approves?" -> "Mark task complete in TodoWrite" [label="yes"];
++    "Read plan, extract all tasks with full text, note context, create TodoWrite" -> "Dispatch @implementer-sp with task text and context";
++    "Dispatch @implementer-sp with task text and context" -> "Implementer asks questions?";
++    "Implementer asks questions?" -> "Answer questions, provide context" [label="yes"];
++    "Answer questions, provide context" -> "Dispatch @implementer-sp with task text and context";
++    "Implementer asks questions?" -> "Implementer implements, tests, commits, self-reviews" [label="no"];
++    "Implementer implements, tests, commits, self-reviews" -> "Dispatch @spec-reviewer-sp with requirements and report";
++    "Dispatch @spec-reviewer-sp with requirements and report" -> "Spec reviewer confirms code matches spec?";
++    "Spec reviewer confirms code matches spec?" -> "Implementer fixes spec gaps" [label="no"];
++    "Implementer fixes spec gaps" -> "Dispatch @spec-reviewer-sp with requirements and report" [label="re-review"];
++    "Spec reviewer confirms code matches spec?" -> "Dispatch @code-reviewer-sp with SHAs and description" [label="yes"];
++    "Dispatch @code-reviewer-sp with SHAs and description" -> "Code reviewer approves?";
++    "Code reviewer approves?" -> "Implementer fixes quality issues" [label="no"];
++    "Implementer fixes quality issues" -> "Dispatch @code-reviewer-sp with SHAs and description" [label="re-review"];
++    "Code reviewer approves?" -> "Mark task complete in TodoWrite" [label="yes"];
+     "Mark task complete in TodoWrite" -> "More tasks remain?";
+-    "More tasks remain?" -> "Dispatch implementer subagent (./implementer-prompt.md)" [label="yes"];
+-    "More tasks remain?" -> "Dispatch final code reviewer subagent for entire implementation" [label="no"];
+-    "Dispatch final code reviewer subagent for entire implementation" -> "Use superpowers:finishing-a-development-branch";
++    "More tasks remain?" -> "Dispatch @implementer-sp with task text and context" [label="yes"];
++    "More tasks remain?" -> "Dispatch @code-reviewer-sp for entire implementation" [label="no"];
++    "Dispatch @code-reviewer-sp for entire implementation" -> "Use superpowers:finishing-a-development-branch";
+ }
+ ```
+ 
+@@ -119,83 +117,114 @@ Implementer subagents report one of four statuses. Handle each appropriately:
+ 
+ **Never** ignore an escalation or force the same model to retry without changes. If the implementer said it's stuck, something needs to change.
+ 
+-## Prompt Templates
++## Agents (OpenCode)
++
++When running in OpenCode, use the dedicated agents registered by the superpowers plugin:
++
++| Agent | Role | Default Model |
++|-------|------|---------------|
++| `@implementer-sp` | Writes code, tests, commits | sonnet |
++| `@spec-reviewer-sp` | Verifies implementation matches spec | sonnet |
++| `@code-reviewer-sp` | Deep code review | opus |
++
++Users can override agent models in their `opencode.json`:
++```json
++{ "agent": { "implementer-sp": { "model": "anthropic/claude-haiku-4-5" } } }
++```
++
++## Prompt Templates (Claude Code / Codex fallback)
++
++When running in OpenCode, use the dedicated agents registered by the superpowers plugin:
++
++| Agent | Role | Default Model |
++|-------|------|---------------|
++| `@sp-implementer` | Writes code, tests, commits | sonnet |
++| `@sp-spec-reviewer` | Verifies implementation matches spec | sonnet |
++| `@sp-code-reviewer` | Deep code review | opus |
++
++Users can override agent models in their `opencode.json`:
++```json
++{ "agent": { "sp-implementer": { "model": "anthropic/claude-haiku-4-5" } } }
++```
++
++## Prompt Templates (Claude Code / Codex fallback)
+ 
++If named agents are not available (e.g. in Claude Code or Codex), use the prompt templates:
+ - `./implementer-prompt.md` - Dispatch implementer subagent
+ - `./spec-reviewer-prompt.md` - Dispatch spec compliance reviewer subagent
+ - `./code-quality-reviewer-prompt.md` - Dispatch code quality reviewer subagent
+ 
+ ## Example Workflow
+ 
+ ```
+ You: I'm using Subagent-Driven Development to execute this plan.
+ 
+ [Read plan file once: docs/superpowers/plans/feature-plan.md]
+ [Extract all 5 tasks with full text and context]
+ [Create TodoWrite with all tasks]
+ 
+ Task 1: Hook installation script
+ 
+ [Get Task 1 text and context (already extracted)]
+-[Dispatch implementation subagent with full task text + context]
++[Dispatch @implementer-sp with full task text + context]
+ 
+ Implementer: "Before I begin - should the hook be installed at user or system level?"
+ 
+ You: "User level (~/.config/superpowers/hooks/)"
+ 
+ Implementer: "Got it. Implementing now..."
+ [Later] Implementer:
+   - Implemented install-hook command
+   - Added tests, 5/5 passing
+   - Self-review: Found I missed --force flag, added it
+   - Committed
+ 
+-[Dispatch spec compliance reviewer]
++[Dispatch @spec-reviewer-sp]
+ Spec reviewer: ✅ Spec compliant - all requirements met, nothing extra
+ 
+-[Get git SHAs, dispatch code quality reviewer]
++[Get git SHAs, dispatch @code-reviewer-sp]
+ Code reviewer: Strengths: Good test coverage, clean. Issues: None. Approved.
+ 
+ [Mark Task 1 complete]
+ 
+ Task 2: Recovery modes
+ 
+ [Get Task 2 text and context (already extracted)]
+-[Dispatch implementation subagent with full task text + context]
++[Dispatch @implementer-sp with full task text + context]
+ 
+ Implementer: [No questions, proceeds]
+ Implementer:
+   - Added verify/repair modes
+   - 8/8 tests passing
+   - Self-review: All good
+   - Committed
+ 
+-[Dispatch spec compliance reviewer]
++[Dispatch @spec-reviewer-sp]
+ Spec reviewer: ❌ Issues:
+   - Missing: Progress reporting (spec says "report every 100 items")
+   - Extra: Added --json flag (not requested)
+ 
+ [Implementer fixes issues]
+ Implementer: Removed --json flag, added progress reporting
+ 
+ [Spec reviewer reviews again]
+ Spec reviewer: ✅ Spec compliant now
+ 
+-[Dispatch code quality reviewer]
++[Dispatch @code-reviewer-sp]
+ Code reviewer: Strengths: Solid. Issues (Important): Magic number (100)
+ 
+ [Implementer fixes]
+ Implementer: Extracted PROGRESS_INTERVAL constant
+ 
+ [Code reviewer reviews again]
+ Code reviewer: ✅ Approved
+ 
+ [Mark Task 2 complete]
+ 
+ ...
+ 
+ [After all tasks]
+-[Dispatch final code-reviewer]
++[Dispatch @code-reviewer-sp for entire implementation]
+ Final reviewer: All requirements met, ready to merge
+ 
+ Done!
+@@ -267,7 +296,7 @@ Done!
+ ## Integration
+ 
+ **Required workflow skills:**
+-- **superpowers:using-git-worktrees** - Ensures isolated workspace (creates one or verifies existing)
++- **superpowers:using-git-worktrees** - REQUIRED: Set up isolated workspace before starting
+ - **superpowers:writing-plans** - Creates the plan this skill executes
+ - **superpowers:requesting-code-review** - Code review template for reviewer subagents
+ - **superpowers:finishing-a-development-branch** - Complete development after all tasks
+diff --git a/skills/subagent-driven-development/code-quality-reviewer-prompt.md b/skills/subagent-driven-development/code-quality-reviewer-prompt.md
+index 51f901a..0cdc9ee 100644
+--- a/skills/subagent-driven-development/code-quality-reviewer-prompt.md
++++ b/skills/subagent-driven-development/code-quality-reviewer-prompt.md
+@@ -7,7 +7,7 @@ Use this template when dispatching a code quality reviewer subagent.
+ **Only dispatch after spec compliance review passes.**
+ 
+ ```
+-Task tool (general-purpose):
++Task tool (use `@code-reviewer-sp` subagent if available in this OpenCode session; otherwise `general-purpose`):
+   Use template at requesting-code-review/code-reviewer.md
+ 
+   DESCRIPTION: [task summary, from implementer's report]
+diff --git a/skills/subagent-driven-development/implementer-prompt.md b/skills/subagent-driven-development/implementer-prompt.md
+index 400c103..677b95b 100644
+--- a/skills/subagent-driven-development/implementer-prompt.md
++++ b/skills/subagent-driven-development/implementer-prompt.md
+@@ -3,7 +3,7 @@
+ Use this template when dispatching an implementer subagent.
+ 
+ ```
+-Task tool (general-purpose):
++Task tool (use `@implementer-sp` subagent if available in this OpenCode session; otherwise `general-purpose`):
+   description: "Implement Task N: [task name]"
+   prompt: |
+     You are implementing Task N: [task name]
+diff --git a/skills/subagent-driven-development/spec-reviewer-prompt.md b/skills/subagent-driven-development/spec-reviewer-prompt.md
+index ab5ddb8..ecd95e1 100644
+--- a/skills/subagent-driven-development/spec-reviewer-prompt.md
++++ b/skills/subagent-driven-development/spec-reviewer-prompt.md
+@@ -5,7 +5,7 @@ Use this template when dispatching a spec compliance reviewer subagent.
+ **Purpose:** Verify implementer built what was requested (nothing more, nothing less)
+ 
+ ```
+-Task tool (general-purpose):
++Task tool (use `@code-reviewer-sp` subagent if available in this OpenCode session; otherwise `general-purpose`):
+   description: "Review spec compliance for Task N"
+   prompt: |
+     You are reviewing whether an implementation matches its specification.
+diff --git a/skills/writing-plans/plan-document-reviewer-prompt.md b/skills/writing-plans/plan-document-reviewer-prompt.md
+index 2db2806..17a1240 100644
+--- a/skills/writing-plans/plan-document-reviewer-prompt.md
++++ b/skills/writing-plans/plan-document-reviewer-prompt.md
+@@ -7,7 +7,7 @@ Use this template when dispatching a plan document reviewer subagent.
+ **Dispatch after:** The complete plan is written.
+ 
+ ```
+-Task tool (general-purpose):
++Task tool (use `@code-reviewer-sp` subagent if available in this OpenCode session; otherwise `general-purpose`):
+   description: "Review plan document"
+   prompt: |
+     You are a plan document reviewer. Verify this plan is complete and ready for implementation.
+-- 
+2.54.0
+
